@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Tuple, Optional, Literal
+from typing import Tuple, Optional, Literal, Union
 
 import torch
 from torch import nn
@@ -765,19 +765,22 @@ class Transformer(nn.Module):
         self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
 
-    @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int = 0):
+    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None, start_pos: int = 0):
         """
         Forward pass for the Transformer model.
 
         Args:
             tokens (torch.Tensor): Input tensor of token IDs with shape (batch_size, seq_len).
+            targets (Optional[torch.Tensor]): Target tokens for computing loss in training.
             start_pos (int, optional): Starting position in the sequence for rotary embeddings. Defaults to 0.
 
         Returns:
-            torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]: 
+                - If training and targets provided: (logits, loss)
+                - If training without targets: logits for all positions
+                - If inference: logits for only the last token
         """
-        seqlen = tokens.size(1)
+        bsz, seqlen = tokens.size()
         h = self.embed(tokens)
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
         mask = None
@@ -785,20 +788,37 @@ class Transformer(nn.Module):
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
-        h = self.norm(h)[:, -1]
-        logits = self.head(h)
-        if world_size > 1:
-            all_logits = [torch.empty_like(logits) for _ in range(world_size)]
-            dist.all_gather(all_logits, logits)
-            logits = torch.cat(all_logits, dim=-1)
-        return logits
-
-
-if __name__ == "__main__":
-    torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device("cuda")
-    torch.manual_seed(0)
-    args = ModelArgs()
-    x = torch.randint(0, args.vocab_size, (2, 128))
-    model = Transformer(args)
-    print(model(x).size())
+        
+        # Apply normalization to the entire sequence
+        h = self.norm(h)
+        
+        # For inference mode, only take the last token
+        if torch.is_inference_mode_enabled():
+            h = h[:, -1]
+            logits = self.head(h)
+            if world_size > 1:
+                all_logits = [torch.empty_like(logits) for _ in range(world_size)]
+                dist.all_gather(all_logits, logits)
+                logits = torch.cat(all_logits, dim=-1)
+            return logits
+        # For training mode, predict next token for all positions
+        else:
+            # Process the entire sequence for training
+            logits = self.head(h)
+            if world_size > 1:
+                all_logits = [torch.empty_like(logits) for _ in range(world_size)]
+                dist.all_gather(all_logits, logits)
+                logits = torch.cat(all_logits, dim=-1)
+            
+            # If targets are provided, calculate loss
+            if targets is not None:
+                # Shift logits and targets for next-token prediction
+                # logits are [b, t, v] and targets are [b, t]
+                shift_logits = logits[:, :-1].contiguous()
+                shift_targets = targets[:, 1:].contiguous()
+                # Flatten the tensors
+                loss_fct = nn.CrossEntropyLoss()
+                loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_targets.view(-1))
+                return logits, loss
+            
+            return logits
